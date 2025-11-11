@@ -1,2 +1,4 @@
 data/
 .venv
+src/notebooks/inception/*.pth
+src/notebooks/inception/*.csv
