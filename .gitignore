@@ -1,4 +1,6 @@
 data/
 .venv
-src/notebooks/inception/*.pth
-src/notebooks/inception/*.csv
+src/notebooks/inception/models/
+src/notebooks/inception/submissions/
+src/notebooks/resnet/models/
+src/notebooks/resnet/submissions/
