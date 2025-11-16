@@ -4,3 +4,4 @@ src/notebooks/inception/models/
 src/notebooks/inception/submissions/
 src/notebooks/resnet/models/
 src/notebooks/resnet/submissions/
+nb_html/*.html
