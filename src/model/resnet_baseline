@@ -1,0 +1,298 @@
+# ============================================
+# 0. Seed 고정 (완전 재현성 모드)
+# ============================================
+import random
+import numpy as np
+import torch
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+seed_everything(42)
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+# ============================================
+# 1. 기본 설정
+# ============================================
+import pandas as pd
+from PIL import Image
+from tqdm.notebook import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+from sklearn.metrics import f1_score, log_loss
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+from sklearn.model_selection import GroupKFold
+import cv2
+import os
+from pathlib import Path
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print("사용 디바이스:", device)
+
+
+# ============================================
+# 2. 경로 설정
+# ============================================
+base_dir = Path("/content")
+driver_csv_path = base_dir / "driver_imgs_list.csv"
+train_dir = base_dir / "imgs" / "train"
+test_dir = base_dir / "imgs" / "test"
+
+print("✅ CSV 경로:", driver_csv_path)
+print("✅ Train 경로:", train_dir)
+print("✅ Test 경로:", test_dir)
+
+
+# ============================================
+# 3. 하이퍼파라미터
+# ============================================
+img_size = 224
+batch_size = 32
+num_classes = 10
+num_epochs = 15
+learning_rate = 3e-4
+weight_decay = 1e-4
+num_workers = 2
+
+
+# ============================================
+# 4. CLAHE 함수 (baseline에서는 사용 X)
+# ============================================
+def apply_clahe(pil_img):
+    img = np.array(pil_img)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(img)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    cl = clahe.apply(l)
+    merged = cv2.merge((cl, a, b))
+    rgb = cv2.cvtColor(merged, cv2.COLOR_LAB2RGB)
+    return Image.fromarray(rgb)
+
+
+# ============================================
+# 5. Dataset
+# ============================================
+class DriverDataset(Dataset):
+    def __init__(self, img_dir, df, driver_list, transform=None, is_test=False):
+        self.img_dir = img_dir
+        self.transform = transform
+        self.is_test = is_test
+        self.images, self.labels = [], []
+
+        if is_test:
+            for img_name in sorted(os.listdir(img_dir)):
+                self.images.append(os.path.join(img_dir, img_name))
+        else:
+            subset = df[df['subject'].isin(driver_list)]
+            for _, row in subset.iterrows():
+                class_name = row['classname']
+                img_name = row['img']
+                path = os.path.join(img_dir, class_name, img_name)
+                self.images.append(path)
+                self.labels.append(int(class_name[1:]))
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_path = self.images[idx]
+        img = Image.open(img_path).convert("RGB")
+        img = img.resize((img_size, img_size))
+
+        if self.transform:
+            img = self.transform(img)
+
+        if self.is_test:
+            return img, os.path.basename(img_path)
+        else:
+            return img, self.labels[idx]
+
+
+# ============================================
+# 6. Transform
+# ============================================
+train_transform = transforms.Compose([
+    transforms.Resize((img_size, img_size)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+eval_transform = transforms.Compose([
+    transforms.Resize((img_size, img_size)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+
+# ============================================
+# 7. Fold 나누기
+# ============================================
+df = pd.read_csv(driver_csv_path)
+groups = df['subject']
+gkf = GroupKFold(n_splits=5)
+folds = list(gkf.split(df, df['classname'], groups))
+
+fold_idx = 0
+train_idx, val_idx = folds[fold_idx]
+train_drivers = df.iloc[train_idx]['subject'].unique()
+val_drivers = df.iloc[val_idx]['subject'].unique()
+
+train_dataset = DriverDataset(train_dir, df, train_drivers, transform=train_transform)
+val_dataset = DriverDataset(train_dir, df, val_drivers, transform=eval_transform)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                          num_workers=num_workers, worker_init_fn=seed_worker,
+                          generator=torch.Generator().manual_seed(42))
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, worker_init_fn=seed_worker,
+                        generator=torch.Generator().manual_seed(42))
+
+
+# ============================================
+# 8. 모델 정의
+# ============================================
+model = models.resnet50(weights="IMAGENET1K_V1")
+model.fc = nn.Linear(model.fc.in_features, num_classes)
+model = model.to(device)
+
+criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+
+# ============================================
+# 9. Train & Eval 함수
+# ============================================
+def train_epoch(model, loader, criterion, optimizer):
+    model.train()
+    running_loss, correct, total = 0.0, 0, 0
+
+    for x, y in tqdm(loader, desc="TRAIN", leave=False):
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        out = model(x)
+        loss = criterion(out, y)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * x.size(0)
+        correct += (out.argmax(1) == y).sum().item()
+        total += y.size(0)
+
+    return running_loss / total, 100 * correct / total
+
+
+def eval_on_loader(model, loader, criterion):
+    model.eval()
+    total, correct, running_loss = 0, 0, 0.0
+    all_probs, all_labels = [], []
+
+    with torch.no_grad():
+        for images, labels in tqdm(loader, desc="VALID", leave=False):
+            images = images.to(device)
+            labels = labels.to(device)
+
+            logits = model(images)
+            loss = criterion(logits, labels)
+
+            running_loss += loss.item() * labels.size(0)
+            preds = logits.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+            probs = logits.softmax(dim=1).cpu().numpy()
+            all_probs.append(probs)
+            all_labels.append(labels.cpu().numpy())
+
+    avg_loss = running_loss / total
+    acc = 100.0 * correct / total
+
+    all_probs = np.concatenate(all_probs, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)
+
+    macro_f1 = f1_score(all_labels, np.argmax(all_probs, axis=1), average='macro')
+    mlogloss = log_loss(all_labels, all_probs, labels=list(range(num_classes)))
+
+    return avg_loss, acc, macro_f1, mlogloss
+
+
+# ============================================
+# 10. 학습 루프
+# ============================================
+best_val_logloss = 1e9
+best_path = f"best_resnet50_fold{fold_idx}.pth"
+history = {'loss': [], 'acc': [], 'f1': [], 'logloss': []}
+
+for epoch in range(num_epochs):
+    print(f"\nEpoch {epoch+1}/{num_epochs}")
+
+    train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer)
+    val_loss, val_acc, val_f1, val_logloss = eval_on_loader(model, val_loader, criterion)
+
+    scheduler.step()
+
+    history['loss'].append(val_loss)
+    history['acc'].append(val_acc)
+    history['f1'].append(val_f1)
+    history['logloss'].append(val_logloss)
+
+    print(f"Train Loss {train_loss:.4f} | Acc {train_acc:.2f}%")
+    print(f"Val   Loss {val_loss:.4f} | Acc {val_acc:.2f}% | F1 {val_f1:.4f} | LogLoss {val_logloss:.4f}")
+
+    if val_logloss < best_val_logloss:
+        best_val_logloss = val_logloss
+        torch.save(model.state_dict(), best_path)
+        print(f"🔥 Best model updated (LogLoss): {best_path}")
+
+
+# ============================================
+# 11. 테스트셋 예측 및 제출 생성
+# ============================================
+print("\n📦 테스트셋 예측 시작…")
+
+model.load_state_dict(torch.load(best_path, map_location=device))
+model.eval()
+
+test_dataset = DriverDataset(test_dir, None, None, transform=eval_transform, is_test=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                         num_workers=num_workers, worker_init_fn=seed_worker,
+                         generator=torch.Generator().manual_seed(42))
+
+all_probs = []
+all_imgs  = []
+
+with torch.no_grad():
+    for imgs, names in tqdm(test_loader, desc="PREDICT"):
+        imgs = imgs.to(device)
+        out = model(imgs)
+        probs = torch.softmax(out, dim=1).cpu().numpy()
+
+        all_probs.append(probs)
+        all_imgs.extend(names)
+
+all_probs = np.vstack(all_probs)
+
+submission = pd.DataFrame({
+    'img': all_imgs,
+    **{f'c{i}': all_probs[:, i] for i in range(10)}
+})
+
+sub_path = f"resnet50_real_baseline.csv"
+submission.to_csv(sub_path, index=False)
+
+print(f"\n✅ 최종 제출 파일 생성 완료: {sub_path}")
+print(submission.head())
